@@ -108,13 +108,13 @@ class PoemTransformer(nn.Module):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.pos_encoding = nn.Parameter(torch.randn(1, n_positions, d_model) * 0.01)
-        self.dropout = nn.Dropout(0.3)
+        self.dropout = nn.Dropout(0.5)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model,
             nhead,
             dim_feedforward=d_model * 4,
-            dropout=0.3,
+            dropout=0.5,
             activation="gelu",
             batch_first=True,
         )
