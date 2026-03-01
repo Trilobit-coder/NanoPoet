@@ -2,6 +2,7 @@ import tiktoken
 
 import os
 import json
+import time
 
 import torch
 import torch.nn as nn
@@ -11,11 +12,12 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 
 
-MAX_POEM_LENGTH = 282
+MAX_POEM_LENGTH = 128
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 use_pin_memory = torch.cuda.is_available()  # Only use pin_memory if GPU exists
+print(f"Cuda available: {torch.cuda.is_available()}")
 
 
 # Read poems from json file
@@ -38,9 +40,12 @@ poems = parse_data("data/poem_tang.json")
 print(f"Total poems:{len(poems)}")
 
 # Split up the data into train and eval
+use_index = int(0.5 * len(poems))
+poems = poems[:use_index]  # only use half of data for GPU RAM
 split_index = int(0.9 * len(poems))  # first 90% will be train, rest eval
 train_poems = poems[:split_index]
 eval_poems = poems[split_index:]
+print(f"Used poems:{len(poems)}")
 print(f"Train poems: {len(train_poems)}")
 print(f"Eval poems: {len(eval_poems)}")
 
@@ -59,15 +64,21 @@ eval_encoded = [
 eval_data = pad_sequence(eval_encoded, batch_first=True, padding_value=0)
 eval_attention_mask = (eval_data != 0).long()
 
+# Free memory
+del train_encoded
+del eval_encoded
+import gc
+
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
 
 class PoemDataset(Dataset):
     def __init__(self, data, attention_mask):
         self.input_ids = data
         self.attention_mask = attention_mask
-
-        # For causal LM, labels are the same as input_ids (shifted inside model)
         self.labels = data.clone()
-        # Set padding tokens to -100 so they're ignored in loss
         self.labels[data == 0] = -100
 
     def __len__(self):
@@ -85,10 +96,10 @@ class PoemDataset(Dataset):
 train_dataset = PoemDataset(train_data, train_attention_mask)
 eval_dataset = PoemDataset(eval_data, eval_attention_mask)
 train_loader = DataLoader(
-    train_dataset, batch_size=32, shuffle=True, num_workers=4, pin_memory=use_pin_memory
+    train_dataset, batch_size=16, shuffle=True, num_workers=2, pin_memory=use_pin_memory
 )
 eval_loader = DataLoader(
-    eval_dataset, batch_size=32, shuffle=False, num_workers=4, pin_memory=use_pin_memory
+    eval_dataset, batch_size=16, shuffle=False, num_workers=2, pin_memory=use_pin_memory
 )
 
 
@@ -96,13 +107,23 @@ class PoemTransformer(nn.Module):
     def __init__(self, vocab_size, n_positions, d_model, nhead, num_layers):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
-        self.pos_encoding = nn.Parameter(torch.randn(1, n_positions, d_model))
-        encoder_layer = nn.TransformerEncoderLayer(d_model, nhead, batch_first=True)
+        self.pos_encoding = nn.Parameter(torch.randn(1, n_positions, d_model) * 0.01)
+        self.dropout = nn.Dropout(0.3)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model,
+            nhead,
+            dim_feedforward=d_model * 4,
+            dropout=0.3,
+            activation="gelu",
+            batch_first=True,
+        )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
         self.lm_head = nn.Linear(d_model, vocab_size)
 
     def forward(self, input_ids, attention_mask=None, labels=None):
         x = self.embedding(input_ids) + self.pos_encoding[:, : input_ids.size(1), :]
+        x = self.dropout(x)
 
         src_key_padding_mask = None
         if attention_mask is not None:
@@ -115,7 +136,6 @@ class PoemTransformer(nn.Module):
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-
             loss = F.cross_entropy(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
@@ -128,68 +148,158 @@ class PoemTransformer(nn.Module):
 model = PoemTransformer(
     vocab_size=100000,  # cl100k_base vocab size
     n_positions=len(train_data[0]),
-    d_model=512,
+    d_model=256,
     nhead=8,
-    num_layers=6,
-)
-
-model = model.to(device)
-optimizer = optim.AdamW(model.parameters(), lr=5e-5)
+    num_layers=4,
+).to(device)
+optimizer = optim.AdamW(model.parameters(), lr=0.001)
 
 
-def train_epoch(model, loader, optimizer, device):
-    model.train()
-    total_loss = 0
+def train(model, train_loader, eval_loader, optimizer, device, epochs=3):
+    for epoch in range(epochs):
+        print(f"\n{'='*50}")
+        print(f"Epoch {epoch+1}/{epochs}")
+        print(f"{'='*50}")
 
-    for batch in loader:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels = batch["labels"].to(device)
+        # Training
+        model.train()
+        total_loss = 0
+        epoch_start = time.time()
+        batch_times = []
 
-        # Forward pass
-        loss, logits = model(input_ids, attention_mask=attention_mask, labels=labels)
+        for batch_idx, batch in enumerate(train_loader):
+            batch_start = time.time()
 
-        # Backward pass
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            labels = batch["labels"].to(device, non_blocking=True)
 
-        total_loss += loss.item()
+            optimizer.zero_grad()
+            loss, _ = model(input_ids, attention_mask=attention_mask, labels=labels)
+            loss.backward()
+            optimizer.step()
 
-    return total_loss / len(loader)
+            total_loss += loss.item()
+            batch_times.append(time.time() - batch_start)
+
+            if batch_idx % 200 == 0:
+                avg_loss = total_loss / (batch_idx + 1)
+                avg_batch_time = (
+                    sum(batch_times[-200:]) / len(batch_times[-200:])
+                    if batch_times
+                    else 0
+                )
+                remaining_batches = len(train_loader) - batch_idx
+                est_time = remaining_batches * avg_batch_time
+
+                print(
+                    f"Batch {batch_idx}/{len(train_loader)} | "
+                    f"Loss: {loss.item():.4f} | "
+                    f"Avg Loss: {avg_loss:.4f} | "
+                    f"Speed: {1/avg_batch_time:.1f} batches/s | "
+                    f"ETA: {est_time/60:.1f}min"
+                )
+
+        epoch_time = time.time() - epoch_start
+        avg_train_loss = total_loss / len(train_loader)
+
+        model.eval()
+        eval_loss = 0
+        with torch.no_grad():
+            for batch in eval_loader:
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                labels = batch["labels"].to(device)
+
+                loss, _ = model(input_ids, attention_mask=attention_mask, labels=labels)
+                eval_loss += loss.item()
+
+        avg_eval_loss = eval_loss / len(eval_loader)
+
+        print(f"\nEpoch {epoch+1} completed in {epoch_time/60:.2f}min")
+        print(f"Train Loss: {avg_train_loss:.4f}")
+        print(f"Eval Loss: {avg_eval_loss:.4f}")
+
+        torch.save(
+            {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "train_loss": avg_train_loss,
+                "eval_loss": avg_eval_loss,
+            },
+            f"poem_epoch_{epoch+1}.pt",
+        )
 
 
-# Training
-print("--- Start Training ---")
-for epoch in range(10):
-    train_loss = train_epoch(model, train_loader, optimizer, device)
-    print(f"Epoch {epoch+1}, Loss: {train_loss:.4f}")
-
-
-def generate_poem(model, prompt, encoding, max_length=128, temperature=0.8):
+def generate(model, prompt, encoding, max_new_tokens=30, temperature=0.8):
     model.eval()
     tokens = encoding.encode(prompt)
     input_ids = torch.tensor([tokens]).to(device)
 
     with torch.no_grad():
-        for _ in range(max_length - len(tokens)):
+        for _ in range(max_new_tokens):
             outputs = model(input_ids)
             logits = outputs[0] if isinstance(outputs, tuple) else outputs
             logits = logits[:, -1, :] / temperature
 
             probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
-
             input_ids = torch.cat([input_ids, next_token], dim=-1)
-
-            # Stop if we hit padding or EOS
-            if next_token.item() == 0:
-                break
 
     return encoding.decode(input_ids[0].tolist())
 
 
-# Test generation
-prompt = "静夜思\n床前明月光"
-generated = generate_poem(model, prompt, encoding)
-print(generated)
+def save_model(model, model_path, dimensions_path):
+    """Simple function to save model weights and dimensions"""
+    torch.save(model.state_dict(), model_path)
+
+    with open(dimensions_path, "w") as f:
+        json.dump(
+            {
+                "vocab_size": model.embedding.num_embeddings,
+                "n_positions": model.pos_encoding.size(1),
+                "d_model": model.embedding.embedding_dim,
+                "nhead": model.transformer.layers[0].self_attn.num_heads,
+                "num_layers": len(model.transformer.layers),
+            },
+            f,
+        )
+
+    print(f"Model saved to {model_path}")
+    print(f"Dimensions saved to {dimensions_path}")
+
+
+def load_model(model_class, model_path, dimensions_path):
+    """Simple function to load model weights and dimensions"""
+    with open(dimensions_path, "r") as f:
+        dimensions = json.load(f)
+
+    model = model_class(
+        vocab_size=dimensions["vocab_size"],
+        n_positions=dimensions["n_positions"],
+        d_model=dimensions["d_model"],
+        nhead=dimensions["nhead"],
+        num_layers=dimensions["num_layers"],
+    )
+
+    model.load_state_dict(torch.load(model_path, weights_only=True))
+    model.to(device)
+    model.eval()
+
+    print(f"Model loaded from {model_path}")
+    return model
+
+
+if os.path.exists("NanoPoet_model.pt"):
+    loaded_model = load_model(
+        PoemTransformer, "NanoPoet_model.pt", "NanoPoet_dimensions.json"
+    )
+else:
+    print("--- Starting Training ---")
+    train(model, train_loader, eval_loader, optimizer, device, epochs=3)
+    save_model(model, "NanoPoet_model.pt", "NanoPoet_dimensions.json")
+
+prompt = "静夜"
+generated = generate(model, prompt, encoding)
+print(f"\nGenerated:\n{generated}\n")
