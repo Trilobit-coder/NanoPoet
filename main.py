@@ -1,5 +1,3 @@
-import tiktoken
-
 import os
 import json
 import time
@@ -50,28 +48,25 @@ print(f"Train poems: {len(train_poems)}")
 print(f"Eval poems: {len(eval_poems)}")
 
 # Encode all poems
-encoding = tiktoken.get_encoding("cl100k_base")
-
-train_encoded = [
-    torch.tensor(encoding.encode(poem), dtype=torch.long) for poem in train_poems
-]
+# here are all the unique characters that occur in this text
+text = "".join(poems)
+chars = sorted(list(set(text)))
+vocab_size = len(chars)
+stoi = {ch: i for i, ch in enumerate(chars)}
+itos = {i: ch for i, ch in enumerate(chars)}
+encode = lambda s: [
+    stoi[c] for c in s
+]  # encoder: take a string, output a list of integers
+decode = lambda l: "".join(
+    [itos[i] for i in l]
+)  # decoder: take a list of integers, output a string
+train_encoded = [torch.tensor(encode(poem), dtype=torch.long) for poem in train_poems]
 train_data = pad_sequence(train_encoded, batch_first=True, padding_value=0)
 train_attention_mask = (train_data != 0).long()
-
-eval_encoded = [
-    torch.tensor(encoding.encode(poem), dtype=torch.long) for poem in eval_poems
-]
+eval_encoded = [torch.tensor(encode(poem), dtype=torch.long) for poem in eval_poems]
 eval_data = pad_sequence(eval_encoded, batch_first=True, padding_value=0)
 eval_attention_mask = (eval_data != 0).long()
-
-# Free memory
-del train_encoded
-del eval_encoded
-import gc
-
-gc.collect()
-if torch.cuda.is_available():
-    torch.cuda.empty_cache()
+print(f"vocab_size: {vocab_size}")
 
 
 class PoemDataset(Dataset):
@@ -96,10 +91,10 @@ class PoemDataset(Dataset):
 train_dataset = PoemDataset(train_data, train_attention_mask)
 eval_dataset = PoemDataset(eval_data, eval_attention_mask)
 train_loader = DataLoader(
-    train_dataset, batch_size=16, shuffle=True, num_workers=2, pin_memory=use_pin_memory
+    train_dataset, batch_size=64, shuffle=True, num_workers=2, pin_memory=use_pin_memory
 )
 eval_loader = DataLoader(
-    eval_dataset, batch_size=16, shuffle=False, num_workers=2, pin_memory=use_pin_memory
+    eval_dataset, batch_size=64, shuffle=False, num_workers=2, pin_memory=use_pin_memory
 )
 
 
@@ -109,6 +104,13 @@ class PoemTransformer(nn.Module):
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.pos_encoding = nn.Parameter(torch.randn(1, n_positions, d_model) * 0.01)
         self.dropout = nn.Dropout(0.5)
+
+        self.register_buffer(
+            "causal_mask",
+            torch.triu(
+                torch.ones(n_positions, n_positions) * float("-inf"), diagonal=1
+            ),
+        )
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model,
@@ -127,9 +129,20 @@ class PoemTransformer(nn.Module):
 
         src_key_padding_mask = None
         if attention_mask is not None:
-            src_key_padding_mask = ~attention_mask.bool()
+            src_key_padding_mask = torch.zeros_like(attention_mask, dtype=x.dtype)
+            src_key_padding_mask = src_key_padding_mask.masked_fill(
+                attention_mask == 0, float("-inf")
+            )
 
-        x = self.transformer(x, src_key_padding_mask=src_key_padding_mask)
+        sz = input_ids.size(1)
+        causal_mask = self.causal_mask[:sz, :sz]
+
+        x = self.transformer(
+            x,
+            mask=causal_mask,  # Causal mask (prevents looking forward)
+            src_key_padding_mask=src_key_padding_mask,  # Padding mask (ignores padding)
+        )
+
         logits = self.lm_head(x)
 
         loss = None
@@ -146,9 +159,9 @@ class PoemTransformer(nn.Module):
 
 
 model = PoemTransformer(
-    vocab_size=100000,  # cl100k_base vocab size
+    vocab_size=vocab_size,
     n_positions=len(train_data[0]),
-    d_model=256,
+    d_model=384,
     nhead=8,
     num_layers=4,
 ).to(device)
@@ -182,7 +195,7 @@ def train(model, train_loader, eval_loader, optimizer, device, epochs=3):
             total_loss += loss.item()
             batch_times.append(time.time() - batch_start)
 
-            if batch_idx % 200 == 0:
+            if batch_idx % 50 == 0:
                 avg_loss = total_loss / (batch_idx + 1)
                 avg_batch_time = (
                     sum(batch_times[-200:]) / len(batch_times[-200:])
@@ -232,9 +245,9 @@ def train(model, train_loader, eval_loader, optimizer, device, epochs=3):
         )
 
 
-def generate(model, prompt, encoding, max_new_tokens=30, temperature=0.8):
+def generate(model, prompt, max_new_tokens=30, temperature=0.8):
     model.eval()
-    tokens = encoding.encode(prompt)
+    tokens = encode(prompt)
     input_ids = torch.tensor([tokens]).to(device)
 
     with torch.no_grad():
@@ -247,7 +260,7 @@ def generate(model, prompt, encoding, max_new_tokens=30, temperature=0.8):
             next_token = torch.multinomial(probs, num_samples=1)
             input_ids = torch.cat([input_ids, next_token], dim=-1)
 
-    return encoding.decode(input_ids[0].tolist())
+    return decode(input_ids[0].tolist())
 
 
 def save_model(model, model_path, dimensions_path):
@@ -291,15 +304,18 @@ def load_model(model_class, model_path, dimensions_path):
     return model
 
 
+from google.colab import files
+
 if os.path.exists("NanoPoet_model.pt"):
-    loaded_model = load_model(
-        PoemTransformer, "NanoPoet_model.pt", "NanoPoet_dimensions.json"
-    )
+    model = load_model(PoemTransformer, "NanoPoet_model.pt", "NanoPoet_dimensions.json")
 else:
     print("--- Starting Training ---")
-    train(model, train_loader, eval_loader, optimizer, device, epochs=3)
+    train(model, train_loader, eval_loader, optimizer, device, epochs=5)
     save_model(model, "NanoPoet_model.pt", "NanoPoet_dimensions.json")
+    files.download("NanoPoet_model.pt")
+    files.download("NanoPoet_dimensions.json")
 
-prompt = "静夜"
-generated = generate(model, prompt, encoding)
+prompt = """静夜
+故鄉"""
+generated = generate(model, prompt)
 print(f"\nGenerated:\n{generated}\n")
